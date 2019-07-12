@@ -25,16 +25,20 @@ class Wait {
  public:
   class promise_type {
    public:
-    Wait get_return_object() {
-      return Wait(promise_.get_future());
+    template <typename SuspendPointHandle>
+    Wait get_return_object(SuspendPointHandle sp) {
+      sp_ = sp;
+      // Get the future first as the call to resume() may complete
+      // concurrently on another thread and destroy the promise before
+      // resume returns.
+      auto f = promise_.get_future();
+      sp.resume()();
+      return Wait(std::move(f));
     }
 
-    std::experimental::suspend_never initial_suspend() {
-      return {};
-    }
-
-    std::experimental::suspend_never final_suspend() {
-      return {};
+    auto done() {
+      sp_.destroy();
+      return std::experimental::noop_continuation();
     }
 
     void return_void() {
@@ -46,6 +50,8 @@ class Wait {
     }
 
    private:
+    std::experimental::suspend_point_handle<std::experimental::with_destroy>
+        sp_;
     std::promise<void> promise_;
   };
 

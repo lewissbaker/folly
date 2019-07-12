@@ -32,7 +32,8 @@ class AwaitableReady {
     return true;
   }
 
-  void await_suspend(std::experimental::coroutine_handle<>) noexcept {}
+  template <typename SuspendPointHandle>
+  void await_suspend(SuspendPointHandle) noexcept {}
 
   T await_resume() noexcept(std::is_nothrow_move_constructible<T>::value) {
     return static_cast<T&&>(value_);
@@ -49,7 +50,8 @@ class AwaitableReady<void> {
   bool await_ready() noexcept {
     return true;
   }
-  void await_suspend(std::experimental::coroutine_handle<>) noexcept {}
+  template <typename SuspendPointHandle>
+  void await_suspend(SuspendPointHandle) noexcept {}
   void await_resume() noexcept {}
 };
 } // namespace coro

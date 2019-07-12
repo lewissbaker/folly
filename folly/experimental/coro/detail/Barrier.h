@@ -45,7 +45,7 @@ class Barrier {
     assert(SIZE_MAX - oldCount >= count);
   }
 
-  std::experimental::coroutine_handle<> arrive() noexcept {
+  std::experimental::continuation_handle arrive() noexcept {
     const std::size_t oldCount = count_.fetch_sub(1, std::memory_order_acq_rel);
 
     // Invalid to call arrive() if you haven't previously incremented the
@@ -55,40 +55,46 @@ class Barrier {
     if (oldCount == 1) {
       return std::exchange(continuation_, {});
     } else {
-      return std::experimental::noop_coroutine();
+      return std::experimental::noop_continuation();
     }
   }
 
-  auto arriveAndWait() noexcept {
-    class Awaiter {
-     public:
-      explicit Awaiter(Barrier& barrier) noexcept : barrier_(barrier) {}
-      bool await_ready() {
-        return false;
-      }
-      std::experimental::coroutine_handle<> await_suspend(
-          std::experimental::coroutine_handle<> continuation) noexcept {
-        barrier_.setContinuation(continuation);
-        return barrier_.arrive();
-      }
-      void await_resume() noexcept {}
+ private:
+  class Awaiter {
+   public:
+    explicit Awaiter(Barrier& barrier) noexcept : barrier_(barrier) {}
 
-     private:
-      Barrier& barrier_;
-    };
+    bool await_ready() {
+      return false;
+    }
 
+    template <typename SuspendPointHandle>
+    std::experimental::continuation_handle await_suspend(
+        SuspendPointHandle sp) noexcept {
+      barrier_.setContinuation(sp.resume());
+      return barrier_.arrive();
+    }
+
+    void await_resume() noexcept {}
+
+   private:
+    Barrier& barrier_;
+  };
+
+ public:
+  Awaiter arriveAndWait() noexcept {
     return Awaiter{*this};
   }
 
   void setContinuation(
-      std::experimental::coroutine_handle<> continuation) noexcept {
+      std::experimental::continuation_handle continuation) noexcept {
     assert(!continuation_);
     continuation_ = continuation;
   }
 
  private:
   std::atomic<std::size_t> count_;
-  std::experimental::coroutine_handle<> continuation_;
+  std::experimental::continuation_handle continuation_;
 };
 
 } // namespace detail

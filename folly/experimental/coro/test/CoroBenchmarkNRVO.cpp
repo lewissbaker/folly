@@ -33,16 +33,20 @@ class Wait {
  public:
   class promise_type {
    public:
-    Wait get_return_object() {
-      return Wait(promise_.get_future());
+    template <typename SuspendPointHandle>
+    Wait get_return_object(SuspendPointHandle sp) {
+      sp_ = sp;
+      // Get the future first as the call to resume() may complete
+      // concurrently on another thread and destroy the promise before
+      // resume returns.
+      auto f = promise_.get_future();
+      sp.resume()();
+      return Wait(std::move(f));
     }
 
-    std::experimental::suspend_never initial_suspend() {
-      return {};
-    }
-
-    std::experimental::suspend_never final_suspend() {
-      return {};
+    auto done() {
+      sp_.destroy();
+      return std::experimental::noop_continuation();
     }
 
     void return_void() {
@@ -54,6 +58,8 @@ class Wait {
     }
 
    private:
+    std::experimental::suspend_point_handle<std::experimental::with_destroy>
+        sp_;
     std::promise<void> promise_;
   };
 
@@ -78,38 +84,11 @@ class Wait {
 template <typename T>
 class InlineTask {
  public:
-  InlineTask(const InlineTask&) = delete;
-  InlineTask(InlineTask&& other)
-      : promise_(std::exchange(other.promise_, nullptr)) {}
-
-  ~InlineTask() {
-    DCHECK(!promise_);
-  }
-
-  bool await_ready() const {
-    return false;
-  }
-
-  std::experimental::coroutine_handle<> await_suspend(
-      std::experimental::coroutine_handle<> awaiter) {
-    promise_->valuePtr_ = &value_;
-    promise_->awaiter_ = std::move(awaiter);
-    return std::experimental::coroutine_handle<promise_type>::from_promise(
-        *promise_);
-  }
-
-  T await_resume() {
-    std::experimental::coroutine_handle<promise_type>::from_promise(
-        *std::exchange(promise_, nullptr))
-        .destroy();
-    T value = std::move(value_);
-    return value;
-  }
-
   class promise_type {
    public:
-    InlineTask get_return_object() {
-      return InlineTask(this);
+    template <typename SuspendPointHandle>
+    InlineTask get_return_object(SuspendPointHandle sp) {
+      return InlineTask(sp);
     }
 
     template <typename U>
@@ -121,47 +100,54 @@ class InlineTask {
       std::terminate();
     }
 
-    std::experimental::suspend_always initial_suspend() {
-      return {};
-    }
-
-    class FinalSuspender {
-     public:
-      explicit FinalSuspender(std::experimental::coroutine_handle<> awaiter)
-          : awaiter_(std::move(awaiter)) {}
-
-      bool await_ready() {
-        return false;
-      }
-
-      auto await_suspend(std::experimental::coroutine_handle<>) {
-        return awaiter_;
-      }
-
-      void await_resume() {}
-
-     private:
-      std::experimental::coroutine_handle<> awaiter_;
-    };
-
-    FinalSuspender final_suspend() {
-      return FinalSuspender(std::move(awaiter_));
+    auto done() {
+      return continuation_;
     }
 
    private:
     friend class InlineTask;
 
     T* valuePtr_;
-    std::experimental::coroutine_handle<> awaiter_;
+    std::experimental::continuation_handle continuation_;
   };
+
+  using handle_t = std::experimental::suspend_point_handle<
+      std::experimental::with_resume,
+      std::experimental::with_destroy,
+      std::experimental::with_promise<promise_type>>;
+
+  InlineTask(const InlineTask&) = delete;
+  InlineTask(InlineTask&& other) : coro_(std::exchange(other.coro_, {})) {}
+
+  ~InlineTask() {
+    DCHECK(!coro_);
+  }
+
+  bool await_ready() const {
+    return false;
+  }
+
+  template <typename SuspendPointHandle>
+  std::experimental::continuation_handle await_suspend(SuspendPointHandle sp) {
+    auto& promise = coro_.promise();
+    promise.valuePtr_ = &value_;
+    promise.continuation_ = sp.resume();
+    return coro_.resume();
+  }
+
+  T await_resume() {
+    std::exchange(coro_, {}).destroy();
+    T value = std::move(value_);
+    return value;
+  }
 
  private:
   friend class promise_type;
 
-  explicit InlineTask(promise_type* promise) : promise_(promise) {}
+  explicit InlineTask(handle_t coro) : coro_(coro) {}
 
   T value_;
-  promise_type* promise_;
+  handle_t coro_;
 };
 
 InlineTask<ExpensiveCopy> co_nestedCalls(size_t times) {

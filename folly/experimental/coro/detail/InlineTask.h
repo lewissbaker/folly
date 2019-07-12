@@ -41,54 +41,11 @@ namespace detail {
 template <typename T>
 class InlineTask;
 
-class InlineTaskPromiseBase {
-  struct FinalAwaiter {
-    bool await_ready() noexcept {
-      return false;
-    }
-
-    template <typename Promise>
-    std::experimental::coroutine_handle<> await_suspend(
-        std::experimental::coroutine_handle<Promise> h) noexcept {
-      InlineTaskPromiseBase& promise = h.promise();
-      return promise.continuation_;
-    }
-
-    void await_resume() noexcept {}
-  };
-
- protected:
-  InlineTaskPromiseBase() noexcept = default;
-
-  InlineTaskPromiseBase(const InlineTaskPromiseBase&) = delete;
-  InlineTaskPromiseBase(InlineTaskPromiseBase&&) = delete;
-  InlineTaskPromiseBase& operator=(const InlineTaskPromiseBase&) = delete;
-  InlineTaskPromiseBase& operator=(InlineTaskPromiseBase&&) = delete;
-
- public:
-  std::experimental::suspend_always initial_suspend() noexcept {
-    return {};
-  }
-
-  auto final_suspend() noexcept {
-    return FinalAwaiter{};
-  }
-
-  void set_continuation(
-      std::experimental::coroutine_handle<> continuation) noexcept {
-    assert(!continuation_);
-    continuation_ = continuation;
-  }
-
- private:
-  std::experimental::coroutine_handle<> continuation_;
-};
-
 template <typename T>
-class InlineTaskPromise : public InlineTaskPromiseBase {
+class InlineTaskPromise {
  public:
   static_assert(
-      std::is_move_constructible<T>::value,
+      std::is_void<T>::value || std::is_move_constructible<T>::value,
       "InlineTask<T> only supports types that are move-constructible.");
   static_assert(
       !std::is_rvalue_reference<T>::value,
@@ -98,11 +55,29 @@ class InlineTaskPromise : public InlineTaskPromiseBase {
 
   ~InlineTaskPromise() = default;
 
-  InlineTask<T> get_return_object() noexcept;
+  InlineTaskPromise(const InlineTaskPromise&) = delete;
+  InlineTaskPromise(InlineTaskPromise&&) = delete;
+  InlineTaskPromise& operator=(const InlineTaskPromise&) = delete;
+  InlineTaskPromise& operator=(InlineTaskPromise&&) = delete;
+
+  template <typename SuspendPointHandle>
+  InlineTask<T> get_return_object(SuspendPointHandle h) noexcept;
+
+  std::experimental::continuation_handle done() noexcept {
+    return continuation_;
+  }
+
+  void set_continuation(
+      std::experimental::continuation_handle continuation) noexcept {
+    assert(!continuation_);
+    continuation_ = continuation;
+  }
 
   template <
       typename Value,
-      std::enable_if_t<std::is_convertible<Value&&, T>::value, int> = 0>
+      std::enable_if_t<
+          !std::is_same_v<Value, T> && std::is_convertible<Value&&, T>::value,
+          int> = 0>
   void return_value(Value&& value) noexcept(
       std::is_nothrow_constructible<T, Value&&>::value) {
     result_.emplace(static_cast<Value&&>(value));
@@ -110,9 +85,16 @@ class InlineTaskPromise : public InlineTaskPromiseBase {
 
   // Also provide non-template overload for T&& so that we can do
   // 'co_return {arg1, arg2}' as shorthand for 'co_return T{arg1, arg2}'.
-  void return_value(T&& value) noexcept(
-      std::is_nothrow_move_constructible<T>::value) {
+  template <typename U = T>
+  void return_value(
+      std::enable_if_t<!std::is_void_v<U>, std::add_rvalue_reference_t<T>>
+          value) noexcept(std::is_nothrow_move_constructible<T>::value) {
     result_.emplace(static_cast<T&&>(value));
+  }
+
+  template <typename U = T, std::enable_if_t<std::is_void_v<U>, int> = 0>
+  void return_void() noexcept {
+    result_.emplace();
   }
 
   void unhandled_exception() noexcept {
@@ -132,29 +114,8 @@ class InlineTaskPromise : public InlineTaskPromiseBase {
       std::reference_wrapper<std::remove_reference_t<T>>,
       T>;
 
+  std::experimental::continuation_handle continuation_;
   folly::Try<StorageType> result_;
-};
-
-template <>
-class InlineTaskPromise<void> : public InlineTaskPromiseBase {
- public:
-  InlineTaskPromise() noexcept = default;
-
-  InlineTask<void> get_return_object() noexcept;
-
-  void return_void() noexcept {}
-
-  void unhandled_exception() noexcept {
-    result_.emplaceException(
-        folly::exception_wrapper::from_exception_ptr(std::current_exception()));
-  }
-
-  void result() {
-    return result_.value();
-  }
-
- private:
-  folly::Try<void> result_;
 };
 
 template <typename T>
@@ -163,9 +124,15 @@ class InlineTask {
   using promise_type = detail::InlineTaskPromise<T>;
 
  private:
-  using handle_t = std::experimental::coroutine_handle<promise_type>;
+  using handle_t = std::experimental::suspend_point_handle<
+      std::experimental::with_resume,
+      std::experimental::with_destroy,
+      std::experimental::with_promise<promise_type>>;
 
  public:
+  // Construct to an invalid InlineTask.
+  InlineTask() noexcept = default;
+
   InlineTask(InlineTask&& other) noexcept
       : coro_(std::exchange(other.coro_, {})) {}
 
@@ -173,6 +140,11 @@ class InlineTask {
     if (coro_) {
       coro_.destroy();
     }
+  }
+
+  InlineTask& operator=(InlineTask other) noexcept {
+    std::swap(coro_, other.coro_);
+    return *this;
   }
 
   class Awaiter {
@@ -187,11 +159,11 @@ class InlineTask {
       return false;
     }
 
-    handle_t await_suspend(
-        std::experimental::coroutine_handle<> awaitingCoroutine) noexcept {
-      assert(coro_ && !coro_.done());
-      coro_.promise().set_continuation(awaitingCoroutine);
-      return coro_;
+    template <typename SuspendPointHandle>
+    auto await_suspend(SuspendPointHandle sp) noexcept {
+      assert(coro_);
+      coro_.promise().set_continuation(sp.resume());
+      return coro_.resume();
     }
 
     T await_resume() {
@@ -207,7 +179,7 @@ class InlineTask {
   };
 
   Awaiter operator co_await() && {
-    assert(coro_ && !coro_.done());
+    assert(coro_);
     return Awaiter{std::exchange(coro_, {})};
   }
 
@@ -218,15 +190,10 @@ class InlineTask {
 };
 
 template <typename T>
-inline InlineTask<T> InlineTaskPromise<T>::get_return_object() noexcept {
-  return InlineTask<T>{
-      std::experimental::coroutine_handle<InlineTaskPromise<T>>::from_promise(
-          *this)};
-}
-
-inline InlineTask<void> InlineTaskPromise<void>::get_return_object() noexcept {
-  return InlineTask<void>{std::experimental::coroutine_handle<
-      InlineTaskPromise<void>>::from_promise(*this)};
+template <typename SuspendPointHandle>
+inline InlineTask<T> InlineTaskPromise<T>::get_return_object(
+    SuspendPointHandle sp) noexcept {
+  return InlineTask<T>{sp};
 }
 
 /// InlineTaskDetached is a coroutine-return type where the coroutine is
@@ -244,23 +211,27 @@ inline InlineTask<void> InlineTaskPromise<void>::get_return_object() noexcept {
 struct InlineTaskDetached {
   class promise_type {
    public:
-    InlineTaskDetached get_return_object() {
+    template <typename SuspendPointHandle>
+    InlineTaskDetached get_return_object(SuspendPointHandle sp) noexcept {
+      sp_ = sp;
+      sp.resume()();
       return {};
     }
 
-    std::experimental::suspend_never initial_suspend() {
-      return {};
+    auto done() noexcept {
+      sp_.destroy();
+      return std::experimental::noop_continuation();
     }
 
-    std::experimental::suspend_never final_suspend() {
-      return {};
-    }
-
-    void return_void() {}
+    void return_void() noexcept {}
 
     [[noreturn]] void unhandled_exception() {
       std::terminate();
     }
+
+   private:
+    std::experimental::suspend_point_handle<std::experimental::with_destroy>
+        sp_;
   };
 };
 

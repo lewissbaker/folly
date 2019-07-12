@@ -40,7 +40,7 @@ void Baton::post() noexcept {
     // a waiting coroutine. We are responsible for resuming it.
     WaitOperation* awaiter = static_cast<WaitOperation*>(oldValue);
     while (awaiter != nullptr) {
-      std::exchange(awaiter, awaiter->next_)->awaitingCoroutine_.resume();
+      std::exchange(awaiter, awaiter->next_)->awaitingCoroutine_.resume()();
     }
   }
 }

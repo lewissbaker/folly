@@ -86,6 +86,9 @@ class Baton {
   void reset() noexcept;
 
   class WaitOperation {
+    using handle_t =
+        std::experimental::suspend_point_handle<std::experimental::with_resume>;
+
    public:
     explicit WaitOperation(const Baton& baton) noexcept : baton_(baton) {}
 
@@ -93,8 +96,7 @@ class Baton {
       return baton_.ready();
     }
 
-    bool await_suspend(
-        std::experimental::coroutine_handle<> awaitingCoroutine) noexcept {
+    bool await_suspend(handle_t awaitingCoroutine) noexcept {
       awaitingCoroutine_ = awaitingCoroutine;
       return baton_.waitImpl(this);
     }
@@ -105,12 +107,12 @@ class Baton {
     friend class Baton;
 
     const Baton& baton_;
-    std::experimental::coroutine_handle<> awaitingCoroutine_;
+    handle_t awaitingCoroutine_;
     WaitOperation* next_;
   };
 
  private:
-  // Try to register the awaiter as
+  // Try to register the awaiter
   bool waitImpl(WaitOperation* awaiter) const noexcept;
 
   // this  - Baton is in the signalled/posted state.

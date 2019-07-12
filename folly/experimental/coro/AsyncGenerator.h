@@ -42,10 +42,15 @@ class AsyncGeneratorPromise {
     bool await_ready() noexcept {
       return false;
     }
-    std::experimental::coroutine_handle<> await_suspend(
-        std::experimental::coroutine_handle<AsyncGeneratorPromise> h) noexcept {
-      return h.promise().continuation_;
+
+    template <typename SuspendPointHandle>
+    std::experimental::continuation_handle await_suspend(
+        SuspendPointHandle sp) noexcept {
+      auto& promise = sp.promise();
+      promise.suspendPoint_ = sp;
+      return std::exchange(promise.continuation_, {});
     }
+
     void await_resume() noexcept {}
   };
 
@@ -56,15 +61,13 @@ class AsyncGeneratorPromise {
     }
   }
 
-  AsyncGenerator<Reference, Value> get_return_object() noexcept;
+  template <typename SuspendPointHandle>
+  AsyncGenerator<Reference, Value> get_return_object(
+      SuspendPointHandle sp) noexcept;
 
-  std::experimental::suspend_always initial_suspend() noexcept {
-    return {};
-  }
-
-  YieldAwaiter final_suspend() noexcept {
-    DCHECK(!hasValue_);
-    return {};
+  auto done() noexcept {
+    DCHECK(continuation_);
+    return continuation_;
   }
 
   YieldAwaiter yield_value(Reference&& value) noexcept(
@@ -98,10 +101,12 @@ class AsyncGeneratorPromise {
 
   void unhandled_exception() noexcept {
     DCHECK(!hasValue_);
+    suspendPoint_ = {};
     exception_ = std::current_exception();
   }
 
   void return_void() noexcept {
+    suspendPoint_ = {};
     DCHECK(!hasValue_);
   }
 
@@ -119,9 +124,32 @@ class AsyncGeneratorPromise {
     executor_ = std::move(executor);
   }
 
-  void setContinuation(
-      std::experimental::coroutine_handle<> continuation) noexcept {
+  void cancel() noexcept {
+    if (hasValue_) {
+      clearValue();
+    }
+
+    if (suspendPoint_) {
+      DCHECK(!continuation_);
+      continuation_ = std::experimental::noop_continuation();
+      suspendPoint_.set_done()();
+    }
+  }
+
+  std::experimental::continuation_handle resume(
+      std::experimental::continuation_handle continuation) noexcept {
+    DCHECK(!continuation_);
+    DCHECK(suspendPoint_);
     continuation_ = continuation;
+    return suspendPoint_.resume();
+  }
+
+  bool hasStarted() const noexcept {
+    return isComplete() || hasValue();
+  }
+
+  bool isComplete() const noexcept {
+    return !suspendPoint_;
   }
 
   void throwIfException() {
@@ -152,7 +180,11 @@ class AsyncGeneratorPromise {
   }
 
  private:
-  std::experimental::coroutine_handle<> continuation_;
+  std::experimental::suspend_point_handle<
+      std::experimental::with_resume,
+      std::experimental::with_set_done>
+      suspendPoint_;
+  std::experimental::continuation_handle continuation_;
   folly::Executor::KeepAlive<> executor_;
   std::exception_ptr exception_;
   ManualLifetime<Reference> value_;
@@ -256,7 +288,9 @@ class FOLLY_NODISCARD AsyncGenerator {
   using promise_type = detail::AsyncGeneratorPromise<Reference, Value>;
 
  private:
-  using handle_t = std::experimental::coroutine_handle<promise_type>;
+  using handle_t = std::experimental::suspend_point_handle<
+      std::experimental::with_destroy,
+      std::experimental::with_promise<promise_type>>;
 
  public:
   using value_type = Value;
@@ -274,17 +308,18 @@ class FOLLY_NODISCARD AsyncGenerator {
         return false;
       }
 
-      handle_t await_suspend(
-          std::experimental::coroutine_handle<> continuation) noexcept {
-        auto& promise = iter_.coro_.promise();
-        promise.setContinuation(continuation);
+      template <typename SuspendPointHandle>
+      std::experimental::continuation_handle await_suspend(
+          SuspendPointHandle sp) noexcept {
+        auto& promise = *iter_.promise_;
         promise.clearValue();
-        return iter_.coro_;
+        return promise.resume(sp.resume());
       }
 
       async_iterator& await_resume() {
-        if (iter_.coro_.done()) {
-          iter_.coro_.promise().throwIfException();
+        auto& promise = *iter_.promise_;
+        if (promise.isComplete()) {
+          promise.throwIfException();
         }
         return iter_;
       }
@@ -301,7 +336,7 @@ class FOLLY_NODISCARD AsyncGenerator {
       friend AdvanceAwaiter co_viaIfAsync(
           folly::Executor::KeepAlive<> executor,
           AdvanceSemiAwaitable awaitable) noexcept {
-        awaitable.iter_.coro_.promise().setExecutor(std::move(executor));
+        awaitable.iter_.promise_->setExecutor(std::move(executor));
         return AdvanceAwaiter{awaitable.iter_};
       }
 
@@ -320,13 +355,14 @@ class FOLLY_NODISCARD AsyncGenerator {
 
     async_iterator() noexcept = default;
 
-    explicit async_iterator(handle_t coro) noexcept : coro_(coro) {}
+    explicit async_iterator(promise_type& promise) noexcept
+        : promise_(&promise) {}
 
-    async_iterator(async_iterator&& other) noexcept
-        : coro_(std::exchange(other.coro_, {})) {}
+    async_iterator(const async_iterator& other) noexcept
+        : promise_(other.promise_) {}
 
-    async_iterator& operator=(async_iterator&& other) noexcept {
-      coro_ = std::exchange(other.coro_, {});
+    async_iterator& operator=(const async_iterator& other) noexcept {
+      promise_ = other.promise_;
       return *this;
     }
 
@@ -336,15 +372,15 @@ class FOLLY_NODISCARD AsyncGenerator {
 
     typename AsyncGenerator::reference operator*() const
         noexcept(std::is_nothrow_copy_constructible<Reference>::value) {
-      return coro_.promise().value();
+      return promise_->value();
     }
 
     typename AsyncGenerator::pointer operator->() const noexcept {
-      return coro_.promise().valuePointer();
+      return promise_->valuePointer();
     }
 
     friend bool operator==(const async_iterator& it, sentinel) noexcept {
-      return !it.coro_ || it.coro_.done();
+      return it.promise_ == nullptr || it.promise_->isComplete();
     }
 
     friend bool operator!=(const async_iterator& it, sentinel s) noexcept {
@@ -360,38 +396,44 @@ class FOLLY_NODISCARD AsyncGenerator {
     }
 
    private:
-    handle_t coro_;
+    promise_type* promise_ = nullptr;
   };
 
  private:
   class FOLLY_NODISCARD BeginAwaiter {
    public:
-    BeginAwaiter(handle_t coro) noexcept : coro_(coro) {}
+    BeginAwaiter(promise_type* promise) noexcept : promise_(promise) {}
 
     bool await_ready() noexcept {
-      return !coro_;
+      return promise_ == nullptr;
     }
 
-    handle_t await_suspend(
-        std::experimental::coroutine_handle<> continuation) noexcept {
-      coro_.promise().setContinuation(continuation);
-      return coro_;
+    template <typename SuspendPointHandle>
+    std::experimental::continuation_handle await_suspend(
+        SuspendPointHandle sp) noexcept {
+      return promise_->resume(sp.resume());
     }
 
     FOLLY_NODISCARD async_iterator await_resume() {
-      if (coro_ && coro_.done()) {
-        coro_.promise().throwIfException();
+      if (promise_ != nullptr) {
+        if (promise_->isComplete()) {
+          promise_->throwIfException();
+        }
+        return async_iterator{*promise_};
       }
-      return async_iterator{coro_};
+      return async_iterator{};
     }
 
    private:
-    handle_t coro_;
+    promise_type* promise_;
   };
 
   class FOLLY_NODISCARD BeginSemiAwaitable {
    public:
-    explicit BeginSemiAwaitable(handle_t coro) noexcept : coro_(coro) {}
+    BeginSemiAwaitable() noexcept : promise_(nullptr) {}
+
+    explicit BeginSemiAwaitable(promise_type& promise) noexcept
+        : promise_(&promise) {}
 
     // A BeginSemiAwaitable requires an executor to be injected by calling
     // the folly::coro::co_viaIfAsync() function. This is done implicitly
@@ -401,14 +443,14 @@ class FOLLY_NODISCARD AsyncGenerator {
     friend BeginAwaiter co_viaIfAsync(
         folly::Executor::KeepAlive<> executor,
         BeginSemiAwaitable&& awaitable) noexcept {
-      if (awaitable.coro_) {
-        awaitable.coro_.promise().setExecutor(std::move(executor));
+      if (awaitable.promise_ != nullptr) {
+        awaitable.promise_->setExecutor(std::move(executor));
       }
-      return BeginAwaiter{awaitable.coro_};
+      return BeginAwaiter{awaitable.promise_};
     }
 
    private:
-    handle_t coro_;
+    promise_type* promise_;
   };
 
  public:
@@ -419,15 +461,13 @@ class FOLLY_NODISCARD AsyncGenerator {
 
   ~AsyncGenerator() {
     if (coro_) {
+      coro_.promise().cancel();
       coro_.destroy();
     }
   }
 
-  AsyncGenerator& operator=(AsyncGenerator&& other) noexcept {
-    auto oldCoro = std::exchange(coro_, std::exchange(other.coro_, {}));
-    if (oldCoro) {
-      oldCoro.destroy();
-    }
+  AsyncGenerator& operator=(AsyncGenerator other) noexcept {
+    swap(other);
     return *this;
   }
 
@@ -450,7 +490,10 @@ class FOLLY_NODISCARD AsyncGenerator {
   // multiple times for the same generator object.
   FOLLY_NODISCARD BeginSemiAwaitable begin() noexcept {
     DCHECK(!hasStarted());
-    return BeginSemiAwaitable{coro_};
+    if (coro_) {
+      return BeginSemiAwaitable{coro_.promise()};
+    }
+    return BeginSemiAwaitable{};
   }
 
   FOLLY_NODISCARD sentinel end() noexcept {
@@ -460,24 +503,24 @@ class FOLLY_NODISCARD AsyncGenerator {
  private:
   friend class detail::AsyncGeneratorPromise<Reference, Value>;
 
-  explicit AsyncGenerator(
-      std::experimental::coroutine_handle<promise_type> coro) noexcept
-      : coro_(coro) {}
+  explicit AsyncGenerator(handle_t coro) noexcept : coro_(coro) {}
 
   bool hasStarted() const noexcept {
-    return coro_ && (coro_.done() || coro_.promise().hasValue());
+    return coro_ && coro_.promise().hasStarted();
   }
 
-  std::experimental::coroutine_handle<promise_type> coro_;
+  handle_t coro_;
 };
 
 namespace detail {
 
 template <typename Reference, typename Value>
+template <typename SuspendPointHandle>
 AsyncGenerator<Reference, Value>
-AsyncGeneratorPromise<Reference, Value>::get_return_object() noexcept {
-  return AsyncGenerator<Reference, Value>{std::experimental::coroutine_handle<
-      AsyncGeneratorPromise<Reference, Value>>::from_promise(*this)};
+AsyncGeneratorPromise<Reference, Value>::get_return_object(
+    SuspendPointHandle sp) noexcept {
+  suspendPoint_ = sp;
+  return AsyncGenerator<Reference, Value>{sp};
 }
 
 template <typename T>

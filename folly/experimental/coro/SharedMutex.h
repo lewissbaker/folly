@@ -199,13 +199,13 @@ class SharedMutexFair {
         : mutex_(&mutex), nextAwaiter_(nullptr), lockType_(lockType) {}
 
     void resume() noexcept {
-      continuation_.resume();
+      continuation_();
     }
 
     SharedMutexFair* mutex_;
     LockAwaiterBase* nextAwaiter_;
     LockAwaiterBase* nextReader_;
-    std::experimental::coroutine_handle<> continuation_;
+    std::experimental::continuation_handle continuation_;
     LockType lockType_;
   };
 
@@ -218,8 +218,9 @@ class SharedMutexFair {
       return mutex_->try_lock();
     }
 
+    template <typename SuspendPointHandle>
     FOLLY_CORO_AWAIT_SUSPEND_NONTRIVIAL_ATTRIBUTES bool await_suspend(
-        std::experimental::coroutine_handle<> continuation) noexcept {
+        SuspendPointHandle sp) noexcept {
       auto lock = mutex_->state_.contextualLock();
 
       // Exclusive lock can only be acquired if it's currently unlocked.
@@ -229,7 +230,7 @@ class SharedMutexFair {
       }
 
       // Append to the end of the waiters queue.
-      continuation_ = continuation;
+      continuation_ = sp.resume();
       *lock->waitersTailNext_ = this;
       lock->waitersTailNext_ = &nextAwaiter_;
       return true;
@@ -247,8 +248,9 @@ class SharedMutexFair {
       return mutex_->try_lock_shared();
     }
 
+    template<typename SuspendPointHandle>
     FOLLY_CORO_AWAIT_SUSPEND_NONTRIVIAL_ATTRIBUTES bool await_suspend(
-        std::experimental::coroutine_handle<> continuation) noexcept {
+        SuspendPointHandle sp) noexcept {
       auto lock = mutex_->state_.contextualLock();
 
       // shared-lock can be acquired if it's either unlocked or it is
@@ -262,7 +264,7 @@ class SharedMutexFair {
 
       // Lock not available immediately.
       // Queue up for later resumption.
-      continuation_ = continuation;
+      continuation_ = sp.resume();
       *lock->waitersTailNext_ = this;
       lock->waitersTailNext_ = &nextAwaiter_;
       return true;
