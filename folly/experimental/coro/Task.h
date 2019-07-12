@@ -44,35 +44,23 @@ class TaskWithExecutor;
 
 namespace detail {
 
-class TaskPromiseBase {
-  class FinalAwaiter {
-   public:
-    bool await_ready() noexcept {
-      return false;
-    }
-
-    template <typename Promise>
-    std::experimental::coroutine_handle<> await_suspend(
-        std::experimental::coroutine_handle<Promise> coro) noexcept {
-      TaskPromiseBase& promise = coro.promise();
-      return promise.continuation_;
-    }
-
-    void await_resume() noexcept {}
-  };
-
-  friend class FinalAwaiter;
-
- protected:
-  TaskPromiseBase() noexcept {}
-
+template <typename T>
+class TaskPromise {
  public:
-  std::experimental::suspend_always initial_suspend() noexcept {
-    return {};
-  }
+  static_assert(
+      !std::is_rvalue_reference_v<T>,
+      "Task<T&&> is not supported. "
+      "Consider using Task<T> or Task<std::unique_ptr<T>> instead.");
 
-  FinalAwaiter final_suspend() noexcept {
-    return {};
+  using StorageType = detail::lift_lvalue_reference_t<T>;
+
+  TaskPromise() noexcept = default;
+
+  template <typename SuspendPointHandle>
+  Task<T> get_return_object(SuspendPointHandle h) noexcept;
+
+  std::experimental::continuation_handle done() noexcept {
+    return continuation_;
   }
 
   template <typename Awaitable>
@@ -85,37 +73,12 @@ class TaskPromiseBase {
     return AwaitableReady<folly::Executor*>{executor_.get()};
   }
 
- private:
-  template <typename T>
-  friend class folly::coro::TaskWithExecutor;
-
-  template <typename T>
-  friend class folly::coro::Task;
-
-  std::experimental::coroutine_handle<> continuation_;
-  folly::Executor::KeepAlive<> executor_;
-};
-
-template <typename T>
-class TaskPromise : public TaskPromiseBase {
- public:
-  static_assert(
-      !std::is_rvalue_reference_v<T>,
-      "Task<T&&> is not supported. "
-      "Consider using Task<T> or Task<std::unique_ptr<T>> instead.");
-
-  using StorageType = detail::lift_lvalue_reference_t<T>;
-
-  TaskPromise() noexcept = default;
-
-  Task<T> get_return_object() noexcept;
-
   void unhandled_exception() noexcept {
     result_.emplaceException(
         exception_wrapper::from_exception_ptr(std::current_exception()));
   }
 
-  template <typename U>
+  template <typename U, std::enable_if_t<std::is_convertible_v<U, T>, int> = 0>
   void return_value(U&& value) {
     static_assert(
         std::is_convertible<U&&, StorageType>::value,
@@ -123,38 +86,23 @@ class TaskPromise : public TaskPromiseBase {
     result_.emplace(static_cast<U&&>(value));
   }
 
-  Try<StorageType>& result() {
-    return result_;
-  }
-
- private:
-  Try<StorageType> result_;
-};
-
-template <>
-class TaskPromise<void> : public TaskPromiseBase {
- public:
-  using StorageType = void;
-
-  TaskPromise() noexcept = default;
-
-  Task<void> get_return_object() noexcept;
-
-  void unhandled_exception() noexcept {
-    result_.emplaceException(
-        exception_wrapper::from_exception_ptr(std::current_exception()));
-  }
-
+  template <typename U = T, std::enable_if_t<std::is_void_v<U>, int> = 0>
   void return_void() noexcept {
     result_.emplace();
   }
 
-  Try<void>& result() {
+  Try<StorageType>& result() noexcept {
     return result_;
   }
 
  private:
-  Try<void> result_;
+  friend class folly::coro::TaskWithExecutor<T>;
+
+  friend class folly::coro::Task<T>;
+
+  std::experimental::continuation_handle continuation_;
+  folly::Executor::KeepAlive<> executor_;
+  Try<StorageType> result_;
 };
 
 } // namespace detail
@@ -167,7 +115,10 @@ class TaskPromise<void> : public TaskPromiseBase {
 /// completes.
 template <typename T>
 class FOLLY_NODISCARD TaskWithExecutor {
-  using handle_t = std::experimental::coroutine_handle<detail::TaskPromise<T>>;
+  using handle_t = std::experimental::suspend_point_handle<
+      std::experimental::with_resume,
+      std::experimental::with_destroy,
+      std::experimental::with_promise<detail::TaskPromise<T>>>;
   using StorageType = typename detail::TaskPromise<T>::StorageType;
 
  public:
@@ -237,17 +188,18 @@ class FOLLY_NODISCARD TaskWithExecutor {
       return false;
     }
 
+    template <typename SuspendPointHandle>
     FOLLY_CORO_AWAIT_SUSPEND_NONTRIVIAL_ATTRIBUTES void await_suspend(
-        std::experimental::coroutine_handle<> continuation) noexcept {
+        SuspendPointHandle sp) noexcept {
       auto& promise = coro_.promise();
       DCHECK(!promise.continuation_);
       DCHECK(promise.executor_);
 
-      promise.continuation_ = continuation;
+      promise.continuation_ = sp.resume();
       promise.executor_->add(
           [coro = coro_, ctx = RequestContext::saveContext()]() mutable {
             RequestContextScopeGuard contextScope{std::move(ctx)};
-            coro.resume();
+            coro.resume()();
           });
     }
 
@@ -322,7 +274,10 @@ class FOLLY_NODISCARD Task {
 
  private:
   class Awaiter;
-  using handle_t = std::experimental::coroutine_handle<promise_type>;
+  using handle_t = std::experimental::suspend_point_handle<
+      std::experimental::with_resume,
+      std::experimental::with_destroy,
+      std::experimental::with_promise<detail::TaskPromise<T>>>;
 
  public:
   Task(const Task& t) = delete;
@@ -371,7 +326,6 @@ class FOLLY_NODISCARD Task {
   }
 
  private:
-  friend class detail::TaskPromiseBase;
   friend class detail::TaskPromise<T>;
 
   class Awaiter {
@@ -392,10 +346,10 @@ class FOLLY_NODISCARD Task {
       return false;
     }
 
-    handle_t await_suspend(
-        std::experimental::coroutine_handle<> continuation) noexcept {
-      coro_.promise().continuation_ = continuation;
-      return coro_;
+    template <typename SuspendPointHandle>
+    auto await_suspend(SuspendPointHandle continuation) noexcept {
+      coro_.promise().continuation_ = continuation.resume();
+      return coro_.resume();
     }
 
     T await_resume() {
@@ -419,15 +373,10 @@ class FOLLY_NODISCARD Task {
 };
 
 template <typename T>
-Task<T> detail::TaskPromise<T>::get_return_object() noexcept {
-  return Task<T>{
-      std::experimental::coroutine_handle<detail::TaskPromise<T>>::from_promise(
-          *this)};
-}
-
-inline Task<void> detail::TaskPromise<void>::get_return_object() noexcept {
-  return Task<void>{std::experimental::coroutine_handle<
-      detail::TaskPromise<void>>::from_promise(*this)};
+template <typename SuspendPointHandle>
+Task<T> detail::TaskPromise<T>::get_return_object(
+    SuspendPointHandle sp) noexcept {
+  return Task<T>{sp};
 }
 
 namespace detail {

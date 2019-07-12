@@ -21,6 +21,7 @@
 #include <folly/Executor.h>
 #include <folly/Traits.h>
 #include <folly/experimental/coro/Traits.h>
+#include <folly/experimental/coro/detail/InlineTask.h>
 #include <folly/io/async/Request.h>
 #include <folly/lang/CustomizationPoint.h>
 
@@ -38,129 +39,63 @@ class ViaCoroutine {
  public:
   class promise_type {
    public:
-    promise_type(folly::Executor::KeepAlive<> executor) noexcept
-        : executor_(std::move(executor)) {}
-
-    ViaCoroutine get_return_object() noexcept {
-      return ViaCoroutine{
-          std::experimental::coroutine_handle<promise_type>::from_promise(
-              *this)};
+    template <typename SuspendPointHandle>
+    ViaCoroutine get_return_object(SuspendPointHandle sp) noexcept {
+      return ViaCoroutine{sp};
     }
 
-    std::experimental::suspend_always initial_suspend() {
-      return {};
-    }
-
-    auto final_suspend() {
-      struct Awaiter {
-        bool await_ready() noexcept {
-          return false;
-        }
-        FOLLY_CORO_AWAIT_SUSPEND_NONTRIVIAL_ATTRIBUTES void await_suspend(
-            std::experimental::coroutine_handle<promise_type> coro) noexcept {
-          // Schedule resumption of the coroutine on the executor.
-          auto& promise = coro.promise();
-          if (!promise.context_) {
-            promise.context_ = RequestContext::saveContext();
-          }
-
-          promise.executor_->add([&promise]() noexcept {
-            RequestContextScopeGuard contextScope{std::move(promise.context_)};
-            promise.continuation_.resume();
-          });
-        }
-        void await_resume() noexcept {}
-      };
-
-      return Awaiter{};
+    auto done() {
+      return continuation_;
     }
 
     [[noreturn]] void unhandled_exception() noexcept {
-      LOG(FATAL) << "ViaCoroutine threw an unhandled exception";
+      std::terminate();
     }
 
     void return_void() noexcept {}
 
-    void setContinuation(
-        std::experimental::coroutine_handle<> continuation) noexcept {
-      DCHECK(!continuation_);
-      continuation_ = continuation;
-    }
-
-    void setContext(std::shared_ptr<RequestContext> context) noexcept {
-      context_ = std::move(context);
-    }
-
    private:
-    folly::Executor::KeepAlive<> executor_;
-    std::experimental::coroutine_handle<> continuation_;
-    std::shared_ptr<RequestContext> context_;
+    friend class ViaCoroutine;
+
+    std::experimental::continuation_handle continuation_;
   };
+
+  using handle_t = std::experimental::suspend_point_handle<
+      std::experimental::with_destroy,
+      std::experimental::with_resume,
+      std::experimental::with_promise<promise_type>>;
+
+  ViaCoroutine() noexcept {}
+
+  explicit ViaCoroutine(handle_t coro) noexcept : coro_(coro) {}
 
   ViaCoroutine(ViaCoroutine&& other) noexcept
       : coro_(std::exchange(other.coro_, {})) {}
 
   ~ViaCoroutine() {
-    destroy();
+    if (coro_) {
+      coro_.destroy();
+    }
   }
 
   ViaCoroutine& operator=(ViaCoroutine other) noexcept {
-    swap(other);
+    std::swap(coro_, other.coro_);
     return *this;
   }
 
-  void swap(ViaCoroutine& other) noexcept {
-    std::swap(coro_, other.coro_);
-  }
-
-  std::experimental::coroutine_handle<> getWrappedCoroutine(
-      std::experimental::coroutine_handle<> continuation) noexcept {
-    if (coro_) {
-      coro_.promise().setContinuation(continuation);
-      return coro_;
-    } else {
-      return continuation;
-    }
-  }
-
-  std::experimental::coroutine_handle<> getWrappedCoroutineWithSavedContext(
-      std::experimental::coroutine_handle<> continuation) noexcept {
-    coro_.promise().setContext(RequestContext::saveContext());
-    return getWrappedCoroutine(continuation);
-  }
-
-  void destroy() {
-    if (coro_) {
-      std::exchange(coro_, {}).destroy();
-    }
-  }
-
-  static ViaCoroutine create(folly::Executor::KeepAlive<> executor) {
-    co_return;
-  }
-
-  static ViaCoroutine createInline() noexcept {
-    return ViaCoroutine{std::experimental::coroutine_handle<promise_type>{}};
+  auto start(std::experimental::continuation_handle continuation) noexcept {
+    coro_.promise().continuation_ = continuation;
+    return coro_.resume();
   }
 
  private:
-  friend class promise_type;
-
-  explicit ViaCoroutine(
-      std::experimental::coroutine_handle<promise_type> coro) noexcept
-      : coro_(coro) {}
-
-  std::experimental::coroutine_handle<promise_type> coro_;
+  handle_t coro_;
 };
 
 } // namespace detail
 
 template <typename Awaiter>
 class ViaIfAsyncAwaiter {
-  using await_suspend_result_t =
-      decltype(std::declval<Awaiter&>().await_suspend(
-          std::declval<std::experimental::coroutine_handle<>>()));
-
  public:
   static_assert(
       folly::coro::is_awaiter_v<Awaiter>,
@@ -170,13 +105,11 @@ class ViaIfAsyncAwaiter {
   explicit ViaIfAsyncAwaiter(
       folly::Executor::KeepAlive<> executor,
       Awaitable&& awaitable)
-      : viaCoroutine_(detail::ViaCoroutine::create(executor)),
-        awaiter_(
-            folly::coro::get_awaiter(static_cast<Awaitable&&>(awaitable))) {}
+      : awaiter_(folly::coro::get_awaiter(static_cast<Awaitable&&>(awaitable))),
+        executor_(std::move(executor)) {}
 
   bool await_ready() noexcept(
       noexcept(std::declval<Awaiter&>().await_ready())) {
-    DCHECK(true);
     return awaiter_.await_ready();
   }
 
@@ -208,38 +141,90 @@ class ViaIfAsyncAwaiter {
   // correctly captures the RequestContext to get correct behaviour in this
   // case.
 
-  template <
-      typename Result = await_suspend_result_t,
-      std::enable_if_t<
-          folly::coro::detail::_is_coroutine_handle<Result>::value,
-          int> = 0>
-  auto
-  await_suspend(std::experimental::coroutine_handle<> continuation) noexcept(
-      noexcept(awaiter_.await_suspend(continuation))) -> Result {
-    return awaiter_.await_suspend(
-        viaCoroutine_.getWrappedCoroutine(continuation));
+ private:
+  class InnerAwaiter {
+   public:
+    explicit InnerAwaiter(Awaiter& awaiter) noexcept : awaiter_(awaiter) {}
+
+    bool await_ready() noexcept {
+      return false;
+    }
+
+    template <typename SuspendPointHandle>
+    auto await_suspend(SuspendPointHandle sp) {
+      using await_suspend_result_t = decltype(awaiter_.await_suspend(sp));
+      if constexpr (
+          std::is_void_v<await_suspend_result_t> ||
+          std::is_same_v<bool, await_suspend_result_t>) {
+        context_ = RequestContext::saveContext();
+      }
+
+      return awaiter_.await_suspend(sp);
+    }
+
+    void await_resume() noexcept {
+      if (!context_) {
+        context_ = RequestContext::saveContext();
+      }
+    }
+
+    std::shared_ptr<RequestContext> stealContext() {
+      return std::move(context_);
+    }
+
+   private:
+    Awaiter& awaiter_;
+    std::shared_ptr<RequestContext> context_;
+  };
+
+  class ScheduleAwaiter {
+    folly::Executor::KeepAlive<> executor_;
+    std::shared_ptr<RequestContext> context_;
+
+   public:
+    explicit ScheduleAwaiter(
+        folly::Executor::KeepAlive<> executor,
+        std::shared_ptr<RequestContext> context) noexcept
+        : executor_(std::move(executor)), context_(std::move(context)) {}
+
+    bool await_ready() noexcept {
+      return false;
+    }
+
+    FOLLY_CORO_AWAIT_SUSPEND_NONTRIVIAL_ATTRIBUTES void await_suspend(
+        std::experimental::suspend_point_handle<std::experimental::with_resume>
+            sp) {
+      executor_->add([sp, ctx = std::move(context_)]() mutable {
+        RequestContextScopeGuard contextScope{std::move(ctx)};
+        sp.resume()();
+      });
+    }
+
+    void await_resume() noexcept {}
+  };
+
+ public:
+  std::experimental::continuation_handle await_suspend(
+      std::experimental::suspend_point_handle<std::experimental::with_resume>
+          sp) {
+    viaCoroutine_ =
+        [](Awaiter& awaiter,
+           folly::Executor::KeepAlive<> executor) -> detail::ViaCoroutine {
+      InnerAwaiter inner{awaiter};
+      co_await inner;
+      co_await ScheduleAwaiter{std::move(executor), inner.stealContext()};
+    }(awaiter_, std::move(executor_));
+    return viaCoroutine_.start(sp.resume());
   }
 
-  template <
-      typename Result = await_suspend_result_t,
-      std::enable_if_t<
-          !folly::coro::detail::_is_coroutine_handle<Result>::value,
-          int> = 0>
-  auto
-  await_suspend(std::experimental::coroutine_handle<> continuation) noexcept(
-      noexcept(awaiter_.await_suspend(continuation))) -> Result {
-    return awaiter_.await_suspend(
-        viaCoroutine_.getWrappedCoroutineWithSavedContext(continuation));
-  }
-
-  decltype(auto) await_resume() noexcept(
-      noexcept(std::declval<Awaiter&>().await_resume())) {
-    viaCoroutine_.destroy();
+  decltype(auto) await_resume() {
     return awaiter_.await_resume();
   }
 
-  detail::ViaCoroutine viaCoroutine_;
+ private:
   Awaiter awaiter_;
+  folly::Executor::KeepAlive<> executor_;
+  detail::ViaCoroutine viaCoroutine_;
 };
 
 template <typename Awaitable>
@@ -361,9 +346,9 @@ struct ViaIfAsyncFunction {
 } // namespace adl
 } // namespace detail
 
-/// Returns a new awaitable that will resume execution of the awaiting coroutine
-/// on a specified executor in the case that the operation does not complete
-/// synchronously.
+/// Returns a new awaitable that will resume execution of the awaiting
+/// coroutine on a specified executor in the case that the operation does not
+/// complete synchronously.
 ///
 /// If the operation completes synchronously then the awaiting coroutine
 /// will continue execution on the current thread without transitioning
@@ -399,9 +384,9 @@ class TryAwaiter {
     return awaiter_.await_ready();
   }
 
-  template <typename Promise>
-  auto await_suspend(std::experimental::coroutine_handle<Promise> coro) {
-    return awaiter_.await_suspend(coro);
+  template <typename SuspendPointHandle>
+  auto await_suspend(SuspendPointHandle sp) {
+    return awaiter_.await_suspend(sp);
   }
 
   auto await_resume() {

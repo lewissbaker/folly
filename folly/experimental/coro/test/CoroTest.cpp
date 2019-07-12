@@ -345,7 +345,8 @@ struct AwaitableInt {
     return true;
   }
 
-  bool await_suspend(std::experimental::coroutine_handle<>) {
+  template <typename Handle>
+  void await_suspend(Handle) {
     LOG(FATAL) << "Should never be called.";
   }
 

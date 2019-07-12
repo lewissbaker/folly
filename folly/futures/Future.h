@@ -2495,16 +2495,17 @@ class FutureAwaitable {
     return std::move(result_);
   }
 
+  template <typename SuspendPointHandle>
   FOLLY_CORO_AWAIT_SUSPEND_NONTRIVIAL_ATTRIBUTES void await_suspend(
-      std::experimental::coroutine_handle<> h) {
+      SuspendPointHandle sp) {
     // FutureAwaitable may get destroyed as soon as the callback is executed.
     // Make sure the future object doesn't get destroyed until setCallback_
     // returns.
     auto future = std::move(future_);
     future.setCallback_(
-        [this, h](Executor::KeepAlive<>&&, Try<T>&& result) mutable {
+        [this, sp](Executor::KeepAlive<>&&, Try<T>&& result) mutable {
           result_ = std::move(result);
-          h.resume();
+          sp.resume()();
         });
   }
 

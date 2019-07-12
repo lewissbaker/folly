@@ -72,7 +72,7 @@ void Mutex::unlock() noexcept {
 
   waiters_ = waitersHead->next_;
 
-  waitersHead->awaitingCoroutine_.resume();
+  waitersHead->awaitingCoroutine_.resume()();
 }
 
 bool Mutex::lockAsyncImpl(LockAwaiter* awaiter) {

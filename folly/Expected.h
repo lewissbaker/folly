@@ -1405,24 +1405,6 @@ bool operator>(const Value& other, const Expected<Value, Error>&) = delete;
 
 namespace folly {
 namespace expected_detail {
-template <typename Value, typename Error>
-struct Promise;
-
-template <typename Value, typename Error>
-struct PromiseReturn {
-  Optional<Expected<Value, Error>> storage_;
-  Promise<Value, Error>* promise_;
-  /* implicit */ PromiseReturn(Promise<Value, Error>& promise) noexcept
-      : promise_(&promise) {
-    promise_->value_ = &storage_;
-  }
-  PromiseReturn(PromiseReturn&& that) noexcept
-      : PromiseReturn{*that.promise_} {}
-  ~PromiseReturn() {}
-  /* implicit */ operator Expected<Value, Error>() & {
-    return std::move(*storage_);
-  }
-};
 
 template <typename Value, typename Error>
 struct Promise {
@@ -1433,54 +1415,84 @@ struct Promise {
   //    folly::Expected<Value, Error> retobj{ p.get_return_object(); } // MSVC
   // or:
   //    auto retobj = p.get_return_object(); // clang
-  PromiseReturn<Value, Error> get_return_object() noexcept {
-    return *this;
+  template <typename SuspendPointHandle>
+  Expected<Value, Error> get_return_object(SuspendPointHandle sp) noexcept {
+    Optional<Expected<Value, Error>> result;
+    value_ = &result;
+
+    // TODO: Use a scope-guard here.
+    try {
+      sp.resume()();
+      sp.destroy();
+    } catch (...) {
+      sp.destroy();
+      throw;
+    }
+
+    assert(result.hasValue());
+
+    return std::move(result.value());
   }
-  std::experimental::suspend_never initial_suspend() const noexcept {
-    return {};
+
+  auto done() const {
+    return std::experimental::noop_continuation();
   }
-  std::experimental::suspend_never final_suspend() const {
-    return {};
-  }
+
   template <typename U>
   void return_value(U&& u) {
     value_->emplace(static_cast<U&&>(u));
   }
-  void unhandled_exception() {
+
+  [[noreturn]] void unhandled_exception() {
     // Technically, throwing from unhandled_exception is underspecified:
     // https://github.com/GorNishanov/CoroutineWording/issues/17
     throw;
   }
 };
 
-template <typename Value, typename Error>
+template <typename E>
 struct Awaitable {
-  Expected<Value, Error> o_;
+  E&& expected_;
 
-  explicit Awaitable(Expected<Value, Error> o) : o_(std::move(o)) {}
+  explicit Awaitable(E&& e) : expected_(static_cast<E&&>(e)) {}
 
   bool await_ready() const noexcept {
-    return o_.hasValue();
-  }
-  Value await_resume() {
-    return std::move(o_.value());
+    return expected_.hasValue();
   }
 
-  // Explicitly only allow suspension into a Promise
-  template <typename U>
-  void await_suspend(std::experimental::coroutine_handle<Promise<U, Error>> h) {
-    *h.promise().value_ = makeUnexpected(std::move(o_.error()));
-    // Abort the rest of the coroutine. resume() is not going to be called
-    h.destroy();
+  template <typename SuspendPointHandle>
+  auto await_suspend(SuspendPointHandle sp) {
+    sp.promise().return_value(
+        makeUnexpected(static_cast<E&&>(expected_).error()));
+    return sp.set_done();
+  }
+
+  decltype(auto) await_resume() noexcept {
+    return static_cast<E&&>(expected_).value();
   }
 };
 } // namespace expected_detail
 
 template <typename Value, typename Error>
-expected_detail::Awaitable<Value, Error>
-/* implicit */ operator co_await(Expected<Value, Error> o) {
-  return expected_detail::Awaitable<Value, Error>{std::move(o)};
+auto operator co_await(Expected<Value, Error>& e) {
+  return expected_detail::Awaitable<Expected<Value, Error>&>{e};
 }
+
+template <typename Value, typename Error>
+auto operator co_await(const Expected<Value, Error>& e) {
+  return expected_detail::Awaitable<const Expected<Value, Error>&>{e};
+}
+
+template <typename Value, typename Error>
+auto operator co_await(Expected<Value, Error>&& e) {
+  return expected_detail::Awaitable<Expected<Value, Error>>{std::move(e)};
+}
+
+template <typename Value, typename Error>
+auto operator co_await(const Expected<Value, Error>&& e) {
+  return expected_detail::Awaitable<const Expected<Value, Error>>{std::move(e)};
+}
+
 } // namespace folly
 
 // This makes folly::Expected<Value> useable as a coroutine return type...

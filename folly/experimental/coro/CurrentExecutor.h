@@ -63,11 +63,12 @@ class co_reschedule_on_current_executor_ {
       return false;
     }
 
+    template <typename SuspendPointHandle>
     FOLLY_CORO_AWAIT_SUSPEND_NONTRIVIAL_ATTRIBUTES void await_suspend(
-        std::experimental::coroutine_handle<> coro) {
-      executor_->add([coro, ctx = RequestContext::saveContext()]() mutable {
+        SuspendPointHandle sp) {
+      executor_->add([sp, ctx = RequestContext::saveContext()]() mutable {
         RequestContextScopeGuard contextScope{std::move(ctx)};
-        coro.resume();
+        sp.resume()();
       });
     }
 

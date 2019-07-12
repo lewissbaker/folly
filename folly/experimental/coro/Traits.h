@@ -26,17 +26,14 @@ namespace coro {
 namespace detail {
 
 template <typename T>
-struct _is_coroutine_handle : std::false_type {};
-
-template <typename T>
-struct _is_coroutine_handle<std::experimental::coroutine_handle<T>>
-    : std::true_type {};
+using _is_continuation_handle =
+    std::is_convertible<T, std::experimental::continuation_handle>;
 
 template <typename T>
 struct _is_valid_await_suspend_return_type : folly::Disjunction<
                                                  std::is_void<T>,
                                                  std::is_same<bool, T>,
-                                                 _is_coroutine_handle<T>> {};
+                                                 _is_continuation_handle<T>> {};
 } // namespace detail
 
 /// is_awaiter<T>::value
@@ -66,14 +63,15 @@ struct is_awaiter<
     folly::void_t<
         decltype(std::declval<T&>().await_ready()),
         decltype(std::declval<T&>().await_suspend(
-            std::declval<std::experimental::coroutine_handle<void>>())),
+            std::declval<std::experimental::suspend_point_handle<
+                std::experimental::with_resume>>())),
         decltype(std::declval<T&>().await_resume())>>
     : folly::Conjunction<
           std::is_same<bool, decltype(std::declval<T&>().await_ready())>,
           detail::_is_valid_await_suspend_return_type<decltype(
               std::declval<T&>().await_suspend(
-                  std::declval<
-                      std::experimental::coroutine_handle<void>>()))>> {};
+                  std::declval<std::experimental::suspend_point_handle<
+                      std::experimental::with_resume>>()))>> {};
 
 template <typename T>
 constexpr bool is_awaiter_v = is_awaiter<T>::value;
@@ -187,7 +185,8 @@ struct await_result {};
 
 template <typename Awaitable>
 struct await_result<Awaitable, std::enable_if_t<is_awaitable_v<Awaitable>>> {
-  using type = decltype(get_awaiter(std::declval<Awaitable>()).await_resume());
+  using type =
+      decltype(std::declval<awaiter_type_t<Awaitable>&>().await_resume());
 };
 
 template <typename Awaitable>

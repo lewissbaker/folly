@@ -69,38 +69,11 @@ class Wait {
 template <typename T>
 class InlineTask {
  public:
-  InlineTask(const InlineTask&) = delete;
-  InlineTask(InlineTask&& other)
-      : promise_(std::exchange(other.promise_, nullptr)) {}
-
-  ~InlineTask() {
-    DCHECK(!promise_);
-  }
-
-  bool await_ready() const {
-    return false;
-  }
-
-  std::experimental::coroutine_handle<> await_suspend(
-      std::experimental::coroutine_handle<> awaiter) {
-    promise_->valuePtr_ = &value_;
-    promise_->awaiter_ = std::move(awaiter);
-    return std::experimental::coroutine_handle<promise_type>::from_promise(
-        *promise_);
-  }
-
-  T await_resume() {
-    std::experimental::coroutine_handle<promise_type>::from_promise(
-        *std::exchange(promise_, nullptr))
-        .destroy();
-    T value = std::move(value_);
-    return value;
-  }
-
   class promise_type {
    public:
-    InlineTask get_return_object() {
-      return InlineTask(this);
+    template <typename SuspendPointHandle>
+    InlineTask get_return_object(SuspendPointHandle sp) {
+      return InlineTask(sp);
     }
 
     template <typename U>
@@ -112,47 +85,54 @@ class InlineTask {
       std::terminate();
     }
 
-    std::experimental::suspend_always initial_suspend() {
-      return {};
-    }
-
-    class FinalSuspender {
-     public:
-      explicit FinalSuspender(std::experimental::coroutine_handle<> awaiter)
-          : awaiter_(std::move(awaiter)) {}
-
-      bool await_ready() {
-        return false;
-      }
-
-      void await_suspend(std::experimental::coroutine_handle<>) {
-        awaiter_();
-      }
-
-      void await_resume() {}
-
-     private:
-      std::experimental::coroutine_handle<> awaiter_;
-    };
-
-    FinalSuspender final_suspend() {
-      return FinalSuspender(std::move(awaiter_));
+    auto done() {
+      return continuation_;
     }
 
    private:
     friend class InlineTask;
 
     T* valuePtr_;
-    std::experimental::coroutine_handle<> awaiter_;
+    std::experimental::continuation_handle continuation_;
   };
+
+  using handle_t = std::experimental::suspend_point_handle<
+      std::experimental::with_resume,
+      std::experimental::with_destroy,
+      std::experimental::with_promise<promise_type>>;
+
+  InlineTask(const InlineTask&) = delete;
+  InlineTask(InlineTask&& other) : coro_(std::exchange(other.coro_, {})) {}
+
+  ~InlineTask() {
+    DCHECK(!coro_);
+  }
+
+  bool await_ready() const {
+    return false;
+  }
+
+  template <typename SuspendPointHandle>
+  std::experimental::continuation_handle await_suspend(SuspendPointHandle sp) {
+    auto& promise = coro_.promise();
+    promise.valuePtr_ = &value_;
+    promise.continuation_ = sp.resume();
+    return coro_.resume();
+  }
+
+  T await_resume() {
+    std::exchange(coro_, {}).destroy();
+    T value = std::move(value_);
+    return value;
+  }
 
  private:
   friend class promise_type;
 
-  explicit InlineTask(promise_type* promise) : promise_(promise) {}
+  explicit InlineTask(handle_t coro) : coro_(coro) {}
 
   T value_;
-  promise_type* promise_;
+  handle_t coro_;
 };
 
 class StackAllocator {
@@ -184,34 +164,6 @@ StackAllocator defaultAllocator(1000 * 512);
 template <typename T>
 class InlineTaskAllocator {
  public:
-  InlineTaskAllocator(const InlineTaskAllocator&) = delete;
-  InlineTaskAllocator(InlineTaskAllocator&& other)
-      : promise_(std::exchange(other.promise_, nullptr)) {}
-
-  ~InlineTaskAllocator() {
-    DCHECK(!promise_);
-  }
-
-  bool await_ready() const {
-    return false;
-  }
-
-  std::experimental::coroutine_handle<> await_suspend(
-      std::experimental::coroutine_handle<> awaiter) {
-    promise_->valuePtr_ = &value_;
-    promise_->awaiter_ = std::move(awaiter);
-    return std::experimental::coroutine_handle<promise_type>::from_promise(
-        *promise_);
-  }
-
-  T await_resume() {
-    std::experimental::coroutine_handle<promise_type>::from_promise(
-        *std::exchange(promise_, nullptr))
-        .destroy();
-    T value = std::move(value_);
-    return value;
-  }
-
   class promise_type {
    public:
     static void* operator new(size_t size) {
@@ -229,8 +181,9 @@ class InlineTaskAllocator {
       allocator->deallocate(ptr, size);
     }
 
-    InlineTaskAllocator get_return_object() {
-      return InlineTaskAllocator(this);
+    template <typename SuspendPointHandle>
+    InlineTaskAllocator get_return_object(SuspendPointHandle sp) {
+      return InlineTaskAllocator(sp);
     }
 
     template <typename U>
@@ -242,47 +195,59 @@ class InlineTaskAllocator {
       std::terminate();
     }
 
-    std::experimental::suspend_always initial_suspend() {
-      return {};
-    }
-
-    class FinalSuspender {
-     public:
-      explicit FinalSuspender(std::experimental::coroutine_handle<> awaiter)
-          : awaiter_(std::move(awaiter)) {}
-
-      bool await_ready() {
-        return false;
-      }
-
-      void await_suspend(std::experimental::coroutine_handle<>) {
-        awaiter_();
-      }
-
-      void await_resume() {}
-
-     private:
-      std::experimental::coroutine_handle<> awaiter_;
-    };
-
-    FinalSuspender final_suspend() {
-      return FinalSuspender(std::move(awaiter_));
+    auto done() {
+      return continuation_;
     }
 
    private:
     friend class InlineTaskAllocator;
 
     T* valuePtr_;
-    std::experimental::coroutine_handle<> awaiter_;
+    std::experimental::continuation_handle continuation_;
   };
+
+  using handle_t = std::experimental::suspend_point_handle<
+      std::experimental::with_resume,
+      std::experimental::with_destroy,
+      std::experimental::with_promise<promise_type>>;
+
+  InlineTaskAllocator(const InlineTaskAllocator&) = delete;
+  InlineTaskAllocator(InlineTaskAllocator&& other)
+      : coro_(std::exchange(other.coro_, {})) {}
+
+  ~InlineTaskAllocator() {
+    DCHECK(!coro_);
+  }
+
+  bool await_ready() const {
+    return false;
+  }
+
+  template <typename SuspendPointHandle>
+  std::experimental::continuation_handle await_suspend(SuspendPointHandle sp) {
+    auto& promise = coro_.promise();
+    promise.valuePtr_ = &value_;
+    promise.continuation_ = sp.resume();
+    return coro_.resume();
+  }
+
+  T await_resume() {
+    std::exchange(coro_, {}).destroy();
+    T value = std::move(value_);
+    return value;
+  }
 
  private:
   friend class promise_type;
 
-  explicit InlineTaskAllocator(promise_type* promise) : promise_(promise) {}
+  explicit InlineTaskAllocator(handle_t coro) : coro_(coro) {}
 
   T value_;
-  promise_type* promise_;
+  std::experimental::suspend_point_handle<
+      std::experimental::with_resume,
+      std::experimental::with_destroy,
+      std::experimental::with_promise<promise_type>>
+      coro_;
 };
 
 class Recursion {

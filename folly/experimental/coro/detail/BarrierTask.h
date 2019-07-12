@@ -32,32 +32,15 @@ class BarrierTaskPromise {};
 class BarrierTask {
  public:
   class promise_type {
-    struct FinalAwaiter {
-      bool await_ready() noexcept {
-        return false;
-      }
-      std::experimental::coroutine_handle<> await_suspend(
-          std::experimental::coroutine_handle<promise_type> h) noexcept {
-        auto& promise = h.promise();
-        assert(promise.barrier_ != nullptr);
-        return promise.barrier_->arrive();
-      }
-      void await_resume() noexcept {}
-    };
-
    public:
-    BarrierTask get_return_object() noexcept {
-      return BarrierTask{
-          std::experimental::coroutine_handle<promise_type>::from_promise(
-              *this)};
+    template <typename SuspendPointHandle>
+    BarrierTask get_return_object(SuspendPointHandle sp) noexcept {
+      return BarrierTask{sp};
     }
 
-    std::experimental::suspend_always initial_suspend() noexcept {
-      return {};
-    }
-
-    FinalAwaiter final_suspend() noexcept {
-      return {};
+    auto done() noexcept {
+      assert(barrier_ != nullptr);
+      return barrier_->arrive();
     }
 
     void return_void() noexcept {}
@@ -76,7 +59,10 @@ class BarrierTask {
   };
 
  private:
-  using handle_t = std::experimental::coroutine_handle<promise_type>;
+  using handle_t = std::experimental::suspend_point_handle<
+      std::experimental::with_resume,
+      std::experimental::with_destroy,
+      std::experimental::with_promise<promise_type>>;
 
   explicit BarrierTask(handle_t coro) noexcept : coro_(coro) {}
 
@@ -102,32 +88,39 @@ class BarrierTask {
   void start(Barrier* barrier) noexcept {
     assert(coro_);
     coro_.promise().setBarrier(barrier);
-    coro_.resume();
+    coro_.resume()();
   }
 
+ private:
+  class StartAndWaitAwaiter {
+   public:
+    explicit StartAndWaitAwaiter(Barrier* barrier, handle_t coro) noexcept
+        : barrier_(barrier), coro_(coro) {}
+
+    bool await_ready() noexcept {
+      return false;
+    }
+
+    template <typename SuspendPointHandle>
+    std::experimental::continuation_handle await_suspend(
+        SuspendPointHandle sp) noexcept {
+      coro_.promise().setBarrier(barrier_);
+      barrier_->setContinuation(sp.resume());
+      return coro_.resume();
+    }
+
+    void await_resume() noexcept {}
+
+   private:
+    Barrier* barrier_;
+    handle_t coro_;
+  };
+
+public:
+
   auto startAndWaitForBarrier(Barrier* barrier) noexcept {
-    class awaiter {
-     public:
-      explicit awaiter(Barrier* barrier, handle_t coro) noexcept
-          : barrier_(barrier), coro_(coro) {}
-      bool await_ready() noexcept {
-        return false;
-      }
-      std::experimental::coroutine_handle<> await_suspend(
-          std::experimental::coroutine_handle<> continuation) noexcept {
-        coro_.promise().setBarrier(barrier_);
-        barrier_->setContinuation(continuation);
-        return coro_;
-      }
-      void await_resume() noexcept {}
-
-     private:
-      Barrier* barrier_;
-      handle_t coro_;
-    };
-
     assert(coro_);
-    return awaiter{barrier, coro_};
+    return StartAndWaitAwaiter{barrier, coro_};
   }
 
  private:

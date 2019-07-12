@@ -27,33 +27,37 @@ using namespace folly::coro;
 template <typename T>
 struct SomeAwaiter1 {
   bool await_ready();
-  void await_suspend(std::experimental::coroutine_handle<>);
+  template <typename Handle>
+  void await_suspend(Handle);
   T await_resume();
 };
 
 template <typename T>
 struct SomeAwaiter2 {
   bool await_ready();
-  bool await_suspend(std::experimental::coroutine_handle<>);
+  template <typename Handle>
+  bool await_suspend(Handle);
   T await_resume();
 };
 
 template <typename T>
 struct SomeAwaiter3 {
   bool await_ready();
-  std::experimental::coroutine_handle<> await_suspend(
-      std::experimental::coroutine_handle<>);
+  template <typename Handle>
+  std::experimental::continuation_handle await_suspend(Handle);
   T await_resume();
 };
 
 struct MissingAwaitReady {
-  void await_suspend(std::experimental::coroutine_handle<>);
+  template <typename Handle>
+  void await_suspend(Handle);
   int await_resume();
 };
 
 struct WrongAwaitReadyReturnType {
   void* await_ready();
-  void await_suspend(std::experimental::coroutine_handle<>);
+  template <typename Handle>
+  void await_suspend(Handle);
   int await_resume();
 };
 
@@ -70,7 +74,8 @@ struct WrongAwaitSuspendArgType {
 
 struct MissingAwaitResume {
   bool await_ready();
-  void await_suspend(std::experimental::coroutine_handle<void>);
+  template <typename Handle>
+  void await_suspend(Handle);
 };
 
 struct MemberOperatorCoAwait {

@@ -31,81 +31,100 @@ class Generator {
   class promise_type final {
    public:
     promise_type() noexcept
-        : m_value(nullptr),
-          m_exception(nullptr),
-          m_root(this),
-          m_parentOrLeaf(this) {}
+        : value_(nullptr),
+          exception_(nullptr),
+          root_(this),
+          parentOrLeaf_(this) {}
 
     promise_type(const promise_type&) = delete;
     promise_type(promise_type&&) = delete;
 
-    auto get_return_object() noexcept {
-      return Generator<T>{*this};
+    template <typename SuspendPointHandle>
+    auto get_return_object(SuspendPointHandle sp) noexcept {
+      suspendPoint_ = sp;
+      return Generator<T>{sp};
     }
 
-    std::experimental::suspend_always initial_suspend() noexcept {
-      return {};
-    }
+    std::experimental::continuation_handle done() noexcept {
+      if (this == root_) {
+        suspendPoint_ = {};
+        return std::experimental::noop_continuation();
+      } else {
+        // This was a nested generator.
+        // We're about to resume the parent generator so update the root
+        // generator's pointer to the new leaf (ie. our parent)
+        root_->parentOrLeaf_ = parentOrLeaf_;
 
-    std::experimental::suspend_always final_suspend() noexcept {
-      return {};
+        if (suspendPoint_) {
+          // We reached done() without passing through either
+          // return_void() or unhandled_exception().
+          // This means we have been cancelled and so should
+          // propagate this cancellation signal to the parent.
+          suspendPoint_ = {};
+          return parentOrLeaf_->suspendPoint_.set_done();
+        } else {
+          return parentOrLeaf_->suspendPoint_.resume();
+        }
+      }
     }
 
     void unhandled_exception() noexcept {
-      m_exception = std::current_exception();
+      suspendPoint_ = {};
+      exception_ = std::current_exception();
     }
 
-    void return_void() noexcept {}
+    void return_void() noexcept {
+      suspendPoint_ = {};
+    }
 
-    std::experimental::suspend_always yield_value(T& value) noexcept {
-      m_value = std::addressof(value);
+    struct YieldValueAwaiter {
+      bool await_ready() {
+        return false;
+      }
+      template <typename SuspendPointHandle>
+      void await_suspend(SuspendPointHandle sp) {
+        sp.promise().suspendPoint_ = sp;
+      }
+      void await_resume() {}
+    };
+
+    YieldValueAwaiter yield_value(T&& value) noexcept {
+      value_ = std::addressof(value);
       return {};
     }
 
-    std::experimental::suspend_always yield_value(T&& value) noexcept {
-      m_value = std::addressof(value);
-      return {};
-    }
+    class YieldSequenceAwaiter {
+     public:
+      explicit YieldSequenceAwaiter(promise_type* childPromise) noexcept
+          : childPromise_(childPromise) {}
 
-    auto yield_value(Generator&& generator) noexcept {
-      return yield_value(generator);
-    }
-
-    auto yield_value(Generator& generator) noexcept {
-      struct awaitable {
-        awaitable(promise_type* childPromise) : m_childPromise(childPromise) {}
-
-        bool await_ready() noexcept {
-          return this->m_childPromise == nullptr;
-        }
-
-        void await_suspend(
-            std::experimental::coroutine_handle<promise_type>) noexcept {}
-
-        void await_resume() {
-          if (this->m_childPromise != nullptr) {
-            this->m_childPromise->throw_if_exception();
-          }
-        }
-
-       private:
-        promise_type* m_childPromise;
-      };
-
-      if (generator.m_promise != nullptr) {
-        m_root->m_parentOrLeaf = generator.m_promise;
-        generator.m_promise->m_root = m_root;
-        generator.m_promise->m_parentOrLeaf = this;
-        generator.m_promise->resume();
-
-        if (!generator.m_promise->is_complete()) {
-          return awaitable{generator.m_promise};
-        }
-
-        m_root->m_parentOrLeaf = this;
+      bool await_ready() noexcept {
+        return childPromise_ == nullptr;
       }
 
-      return awaitable{nullptr};
+      template <typename SuspendPointHandle>
+      auto await_suspend(SuspendPointHandle sp) noexcept {
+        sp.promise().suspendPoint_ = sp;
+        return childPromise_->suspendPoint_.resume();
+      }
+
+      void await_resume() {
+        if (childPromise_ != nullptr) {
+          childPromise_->throwIfException();
+        }
+      }
+
+     private:
+      promise_type* childPromise_;
+    };
+
+    YieldSequenceAwaiter yield_value(Generator&& generator) noexcept {
+      if (generator.promise_ != nullptr) {
+        root_->parentOrLeaf_ = generator.promise_;
+        generator.promise_->root_ = root_;
+        generator.promise_->parentOrLeaf_ = this;
+      }
+      return YieldSequenceAwaiter{generator.promise_};
     }
 
     // Don't allow any use of 'co_await' inside the Generator
@@ -113,87 +132,89 @@ class Generator {
     template <typename U>
     std::experimental::suspend_never await_transform(U&& value) = delete;
 
-    void destroy() noexcept {
-      std::experimental::coroutine_handle<promise_type>::from_promise(*this)
-          .destroy();
-    }
-
-    void throw_if_exception() {
-      if (m_exception != nullptr) {
-        std::rethrow_exception(std::move(m_exception));
+    void throwIfException() {
+      if (exception_) {
+        std::rethrow_exception(std::move(exception_));
       }
     }
 
-    bool is_complete() noexcept {
-      return std::experimental::coroutine_handle<promise_type>::from_promise(
-                 *this)
-          .done();
+    // Cancel this generator.
+    // Only valid to call this on the root generator.
+    void cancel() noexcept {
+      assert(this == root_);
+      if (!isComplete()) {
+        // Start cancelling from the leaf.
+        // This should proceed to unwind from the leaf back up to the
+        // parent.
+        parentOrLeaf_->suspendPoint_.set_done()();
+        assert(isComplete());
+      }
+    }
+
+    void pull() {
+      assert(this == root_);
+      assert(!isComplete());
+      parentOrLeaf_->suspendPoint_.resume()();
+      if (isComplete()) {
+        throwIfException();
+      }
+    }
+
+    bool isComplete() noexcept {
+      return !suspendPoint_;
     }
 
     T& value() noexcept {
-      assert(this == m_root);
-      assert(!is_complete());
-      return *(m_parentOrLeaf->m_value);
-    }
-
-    void pull() noexcept {
-      assert(this == m_root);
-      assert(!m_parentOrLeaf->is_complete());
-
-      m_parentOrLeaf->resume();
-
-      while (m_parentOrLeaf != this && m_parentOrLeaf->is_complete()) {
-        m_parentOrLeaf = m_parentOrLeaf->m_parentOrLeaf;
-        m_parentOrLeaf->resume();
-      }
+      assert(this == root_);
+      assert(!isComplete());
+      return *(parentOrLeaf_->value_);
     }
 
    private:
-    void resume() noexcept {
-      std::experimental::coroutine_handle<promise_type>::from_promise(*this)
-          .resume();
-    }
+    using suspend_point_t = std::experimental::suspend_point_handle<
+        std::experimental::with_resume,
+        std::experimental::with_set_done>;
 
-    std::add_pointer_t<T> m_value;
-    std::exception_ptr m_exception;
+    suspend_point_t suspendPoint_;
 
-    promise_type* m_root;
+    std::add_pointer_t<T> value_;
+    std::exception_ptr exception_;
+
+    promise_type* root_;
 
     // If this is the promise of the root generator then this field
     // is a pointer to the leaf promise.
     // For non-root generators this is a pointer to the parent promise.
-    promise_type* m_parentOrLeaf;
+    promise_type* parentOrLeaf_;
   };
 
-  Generator() noexcept : m_promise(nullptr) {}
+  using handle_t = std::experimental::suspend_point_handle<
+      std::experimental::with_destroy,
+      std::experimental::with_promise<promise_type>>;
 
-  Generator(promise_type& promise) noexcept : m_promise(&promise) {}
+  Generator() noexcept = default;
 
-  Generator(Generator&& other) noexcept : m_promise(other.m_promise) {
-    other.m_promise = nullptr;
-  }
+  explicit Generator(handle_t coro) noexcept : coro_(coro) {}
+
+  Generator(Generator&& other) noexcept
+      : coro_(std::exchange(other.coro_, {})) {}
 
   Generator(const Generator& other) = delete;
   Generator& operator=(const Generator& other) = delete;
 
   ~Generator() {
-    if (m_promise != nullptr) {
-      m_promise->destroy();
+    if (coro_) {
+      coro_.promise().cancel();
+      coro_.destroy();
     }
   }
 
-  Generator& operator=(Generator&& other) noexcept {
-    if (this != &other) {
-      if (m_promise != nullptr) {
-        m_promise->destroy();
-      }
-
-      m_promise = other.m_promise;
-      other.m_promise = nullptr;
-    }
-
+  Generator& operator=(Generator other) noexcept {
+    swap(other);
     return *this;
   }
+
+  class sentinel {};
 
   class iterator {
    public:
@@ -205,29 +226,30 @@ class Generator {
     using reference = std::conditional_t<std::is_reference_v<T>, T, T&>;
     using pointer = std::add_pointer_t<T>;
 
-    iterator() noexcept : m_promise(nullptr) {}
+    iterator() noexcept : promise_(nullptr) {}
 
-    explicit iterator(promise_type* promise) noexcept : m_promise(promise) {}
+    explicit iterator(promise_type& promise) noexcept : promise_(&promise) {}
 
-    bool operator==(const iterator& other) const noexcept {
-      return m_promise == other.m_promise;
+    friend bool operator==(const iterator& it, sentinel) noexcept {
+      return it.promise_ == nullptr || it.promise_->isComplete();
     }
 
-    bool operator!=(const iterator& other) const noexcept {
-      return m_promise != other.m_promise;
+    friend bool operator!=(const iterator& it, sentinel s) noexcept {
+      return !(it == s);
+    }
+
+    friend bool operator==(sentinel s, const iterator& it) noexcept {
+      return (it == s);
+    }
+
+    friend bool operator!=(sentinel s, const iterator& it) noexcept {
+      return !(it == s);
     }
 
     iterator& operator++() {
-      assert(m_promise != nullptr);
-      assert(!m_promise->is_complete());
-
-      m_promise->pull();
-      if (m_promise->is_complete()) {
-        auto* temp = m_promise;
-        m_promise = nullptr;
-        temp->throw_if_exception();
-      }
-
+      assert(promise_ != nullptr);
+      assert(!promise_->isComplete());
+      promise_->pull();
       return *this;
     }
 
@@ -236,8 +258,8 @@ class Generator {
     }
 
     reference operator*() const noexcept {
-      assert(m_promise != nullptr);
-      return static_cast<reference>(m_promise->value());
+      assert(promise_ != nullptr);
+      return static_cast<reference>(promise_->value());
     }
 
     pointer operator->() const noexcept {
@@ -245,34 +267,31 @@ class Generator {
     }
 
    private:
-    promise_type* m_promise;
+    promise_type* promise_;
   };
 
   iterator begin() {
-    if (m_promise != nullptr) {
-      m_promise->pull();
-      if (!m_promise->is_complete()) {
-        return iterator(m_promise);
-      }
-
-      m_promise->throw_if_exception();
+    if (coro_) {
+      auto& promise = coro_.promise();
+      assert(!promise.isComplete());
+      promise.pull();
+      return iterator{promise};
     }
-
-    return iterator(nullptr);
+    return iterator{};
   }
 
-  iterator end() noexcept {
-    return iterator(nullptr);
+  sentinel end() noexcept {
+    return {};
   }
 
   void swap(Generator& other) noexcept {
-    std::swap(m_promise, other.m_promise);
+    std::swap(coro_, other.coro_);
   }
 
  private:
   friend class promise_type;
 
-  promise_type* m_promise;
+  handle_t coro_;
 };
 
 template <typename T>

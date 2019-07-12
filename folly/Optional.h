@@ -600,24 +600,6 @@ FOLLY_NAMESPACE_STD_END
 
 namespace folly {
 namespace detail {
-template <typename Value>
-struct OptionalPromise;
-
-template <typename Value>
-struct OptionalPromiseReturn {
-  Optional<Value> storage_;
-  OptionalPromise<Value>* promise_;
-  /* implicit */ OptionalPromiseReturn(OptionalPromise<Value>& promise) noexcept
-      : promise_(&promise) {
-    promise.value_ = &storage_;
-  }
-  OptionalPromiseReturn(OptionalPromiseReturn&& that) noexcept
-      : OptionalPromiseReturn{*that.promise_} {}
-  ~OptionalPromiseReturn() {}
-  /* implicit */ operator Optional<Value>() & {
-    return std::move(storage_);
-  }
-};
 
 template <typename Value>
 struct OptionalPromise {
@@ -628,19 +610,32 @@ struct OptionalPromise {
   //    folly::Optional<Value> retobj{ p.get_return_object(); } // MSVC
   // or:
   //    auto retobj = p.get_return_object(); // clang
-  OptionalPromiseReturn<Value> get_return_object() noexcept {
-    return *this;
+  template <typename SuspendPointHandle>
+  Optional<Value> get_return_object(SuspendPointHandle h) noexcept {
+    Optional<Value> result;
+    value_ = &result;
+
+    // TODO: Use a scope-guard here.
+    try {
+      h.resume()();
+      h.destroy();
+    } catch (...) {
+      h.destroy();
+      throw;
+    }
+
+    return result;
   }
-  std::experimental::suspend_never initial_suspend() const noexcept {
-    return {};
+
+  auto done() const {
+    return std::experimental::noop_continuation();
   }
-  std::experimental::suspend_never final_suspend() const {
-    return {};
-  }
+
   template <typename U>
   void return_value(U&& u) {
     *value_ = static_cast<U&&>(u);
   }
+
   void unhandled_exception() {
     // Technically, throwing from unhandled_exception is underspecified:
     // https://github.com/GorNishanov/CoroutineWording/issues/17
@@ -648,31 +643,46 @@ struct OptionalPromise {
   }
 };
 
-template <typename Value>
+template <typename Optional>
 struct OptionalAwaitable {
-  Optional<Value> o_;
+  Optional&& o_;
   bool await_ready() const noexcept {
     return o_.hasValue();
   }
-  Value await_resume() {
-    return std::move(o_.value());
+
+  decltype(auto) await_resume() noexcept {
+    return static_cast<Optional&&>(o_).value();
   }
 
-  // Explicitly only allow suspension into an OptionalPromise
-  template <typename U>
-  void await_suspend(
-      std::experimental::coroutine_handle<OptionalPromise<U>> h) const {
-    // Abort the rest of the coroutine. resume() is not going to be called
-    h.destroy();
+  template <typename SuspendPointHandle>
+  auto await_suspend(SuspendPointHandle sp) const {
+    sp.promise().return_value(folly::none);
+    return sp.set_done();
   }
 };
+
 } // namespace detail
 
 template <typename Value>
-detail::OptionalAwaitable<Value>
-/* implicit */ operator co_await(Optional<Value> o) {
-  return {std::move(o)};
+auto operator co_await(Optional<Value>& o) noexcept {
+  return detail::OptionalAwaitable<Optional<Value>&>{o};
 }
+
+template <typename Value>
+auto operator co_await(const Optional<Value>& o) noexcept {
+  return detail::OptionalAwaitable<const Optional<Value>&>{o};
+}
+
+template <typename Value>
+auto operator co_await(Optional<Value>&& o) noexcept {
+  return detail::OptionalAwaitable<Optional<Value>>{std::move(o)};
+}
+
+template <typename Value>
+auto operator co_await(const Optional<Value>&& o) noexcept {
+  return detail::OptionalAwaitable<const Optional<Value>>{std::move(o)};
+}
+
 } // namespace folly
 
 // This makes folly::Optional<Value> useable as a coroutine return type..

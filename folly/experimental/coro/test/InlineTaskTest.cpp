@@ -27,6 +27,13 @@
 template <typename T>
 using InlineTask = folly::coro::detail::InlineTask<T>;
 
+static_assert(
+    std::is_same_v<folly::coro::await_result_t<InlineTask<void>>, void>);
+static_assert(
+    std::is_same_v<folly::coro::await_result_t<InlineTask<int>>, int>);
+static_assert(
+    std::is_same_v<folly::coro::await_result_t<InlineTask<int&>>, int&>);
+
 TEST(InlineTask, CallVoidTaskWithoutAwaitingNeverRuns) {
   bool hasStarted = false;
   auto f = [&]() -> InlineTask<void> {
@@ -243,6 +250,9 @@ TEST(InlineTask, ExceptionsPropagateFromReturnValueConstructor) {
   EXPECT_THROW(folly::coro::blockingWait(f()), MyException);
 }
 
+// Guaranteed tail-recursion not yet implemented in compiler.
+#if 0
+
 InlineTask<void> recursiveTask(int depth) {
   if (depth > 0) {
     co_await recursiveTask(depth - 1);
@@ -276,5 +286,7 @@ TEST(InlineTask, DeepRecursionOfExceptions) {
   EXPECT_THROW(
       folly::coro::blockingWait(recursiveThrowingTask(50000)), MyException);
 }
+
+#endif
 
 #endif

@@ -100,7 +100,8 @@ struct TrickyAwaitable {
       return false;
     }
 
-    bool await_suspend(std::experimental::coroutine_handle<>) {
+    template <typename SuspendPointHandle>
+    bool await_suspend(SuspendPointHandle) {
       value_ = std::make_unique<int>(42);
       return false;
     }
@@ -149,8 +150,8 @@ class SimplePromise {
       return awaiter_.await_ready();
     }
 
-    template <typename Promise>
-    auto await_suspend(std::experimental::coroutine_handle<Promise> h) {
+    template <typename Handle>
+    auto await_suspend(Handle h) {
       return awaiter_.await_suspend(h);
     }
 
